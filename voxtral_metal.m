@@ -255,6 +255,49 @@ static void clear_activation_pool(void) {
 }
 
 /* ========================================================================
+ * MPS Matmul Operator Cache
+ * Reuse MPSMatrixMultiplication objects across calls with same shape/config.
+ * ======================================================================== */
+
+static NSMutableDictionary *g_matmul_op_cache = nil;
+static pthread_mutex_t g_matmul_op_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static MPSMatrixMultiplication *get_cached_matmul_op(BOOL transposeLeft, BOOL transposeRight,
+                                                      int resultRows, int resultColumns,
+                                                      int interiorColumns,
+                                                      double alpha, double beta) {
+    pthread_mutex_lock(&g_matmul_op_mutex);
+    if (!g_matmul_op_cache) g_matmul_op_cache = [NSMutableDictionary new];
+
+    NSString *key = [NSString stringWithFormat:@"%d:%d:%d:%d:%d:%.9g:%.9g",
+                                               (int)transposeLeft, (int)transposeRight,
+                                               resultRows, resultColumns, interiorColumns,
+                                               alpha, beta];
+    MPSMatrixMultiplication *mm = [g_matmul_op_cache objectForKey:key];
+    if (!mm) {
+        mm = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:transposeLeft
+              transposeRight:transposeRight
+                  resultRows:resultRows
+               resultColumns:resultColumns
+             interiorColumns:interiorColumns
+                       alpha:alpha
+                        beta:beta];
+        if (mm) [g_matmul_op_cache setObject:mm forKey:key];
+    }
+
+    pthread_mutex_unlock(&g_matmul_op_mutex);
+    return mm;
+}
+
+static void clear_matmul_op_cache(void) {
+    pthread_mutex_lock(&g_matmul_op_mutex);
+    g_matmul_op_cache = nil;
+    pthread_mutex_unlock(&g_matmul_op_mutex);
+}
+
+/* ========================================================================
  * Shader Compilation
  * ======================================================================== */
 
@@ -365,6 +408,7 @@ void vox_metal_shutdown(void) {
         clear_f16_cache();
         clear_weight_cache();
         clear_activation_pool();
+        clear_matmul_op_cache();
 
         g_rms_norm_pipeline = nil;
         g_silu_pipeline = nil;
@@ -438,15 +482,13 @@ void vox_metal_sgemm_bf16(int M, int N, int K,
         MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
 
         /* C = A @ B^T */
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:M
-               resultColumns:N
-             interiorColumns:K
-                       alpha:1.0
-                        beta:0.0];
+        MPSMatrixMultiplication *matmul =
+            get_cached_matmul_op(NO, YES, M, N, K, 1.0, 0.0);
+        if (!matmul) {
+            pool_release_buffer(bufferA);
+            pool_release_buffer(bufferC);
+            return;
+        }
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -512,15 +554,13 @@ void vox_metal_sgemm(int M, int N, int K,
         MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB descriptor:descB];
         MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
 
-        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
-            initWithDevice:g_device
-               transposeLeft:NO
-              transposeRight:YES
-                  resultRows:M
-               resultColumns:N
-             interiorColumns:K
-                       alpha:1.0
-                        beta:0.0];
+        MPSMatrixMultiplication *matmul =
+            get_cached_matmul_op(NO, YES, M, N, K, 1.0, 0.0);
+        if (!matmul) {
+            pool_release_buffer(bufferA);
+            pool_release_buffer(bufferC);
+            return;
+        }
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
         [matmul encodeToCommandBuffer:cmdBuffer
@@ -602,10 +642,15 @@ void vox_metal_fused_qkv_bf16(int M, int K,
                                 dataType:MPSDataTypeFloat32];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWq descriptor:descW];
             MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufQ descriptor:descOut];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:Nq interiorColumns:K
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, Nq, K, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufQ);
+                pool_release_buffer(bufK);
+                pool_release_buffer(bufV);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
         }
 
@@ -621,10 +666,15 @@ void vox_metal_fused_qkv_bf16(int M, int K,
                                 dataType:MPSDataTypeFloat32];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWk descriptor:descW];
             MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufK descriptor:descOut];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:Nk interiorColumns:K
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, Nk, K, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufQ);
+                pool_release_buffer(bufK);
+                pool_release_buffer(bufV);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
         }
 
@@ -640,10 +690,15 @@ void vox_metal_fused_qkv_bf16(int M, int K,
                                 dataType:MPSDataTypeFloat32];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWv descriptor:descW];
             MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufV descriptor:descOut];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:Nv interiorColumns:K
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, Nv, K, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufQ);
+                pool_release_buffer(bufK);
+                pool_release_buffer(bufV);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
         }
 
@@ -730,10 +785,15 @@ void vox_metal_fused_ffn_bf16(int M, int dim, int hidden,
                                 dataType:MPSDataTypeFloat16];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW1 descriptor:descW];
             MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descHidden];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:hidden interiorColumns:dim
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufGate);
+                pool_release_buffer(bufUp);
+                pool_release_buffer(bufOutput);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matGate];
         }
 
@@ -745,10 +805,15 @@ void vox_metal_fused_ffn_bf16(int M, int dim, int hidden,
                                 dataType:MPSDataTypeFloat16];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW3 descriptor:descW];
             MPSMatrix *matUp = [[MPSMatrix alloc] initWithBuffer:bufUp descriptor:descHidden];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:hidden interiorColumns:dim
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufGate);
+                pool_release_buffer(bufUp);
+                pool_release_buffer(bufOutput);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matUp];
         }
 
@@ -792,10 +857,15 @@ void vox_metal_fused_ffn_bf16(int M, int dim, int hidden,
             MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descHidden];
             MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW];
             MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufOutput descriptor:descOut];
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:M resultColumns:dim interiorColumns:hidden
-                         alpha:1.0 beta:0.0];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, M, dim, hidden, 1.0, 0.0);
+            if (!mm) {
+                pool_release_buffer(bufInput);
+                pool_release_buffer(bufGate);
+                pool_release_buffer(bufUp);
+                pool_release_buffer(bufOutput);
+                return;
+            }
             [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matGate rightMatrix:matW resultMatrix:matOut];
         }
 
@@ -867,6 +937,18 @@ void vox_metal_batched_attention(float *out,
         size_t out_row_bytes = q_row_bytes;
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        MPSMatrixMultiplication *mm_qk =
+            get_cached_matmul_op(NO, YES, seq_q, seq_k, head_dim, (double)scale, 0.0);
+        MPSMatrixMultiplication *mm_sv =
+            get_cached_matmul_op(NO, NO, seq_q, head_dim, seq_k, 1.0, 0.0);
+        if (!mm_qk || !mm_sv) {
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            pool_release_buffer(bufScores);
+            pool_release_buffer(bufOut);
+            return;
+        }
 
         /* --- Step 1: QK^T per head --- */
         for (int h = 0; h < n_heads; h++) {
@@ -903,11 +985,7 @@ void vox_metal_batched_attention(float *out,
                     descriptor:descSh];
 
             /* scores_h = scale * Q_h @ K_h^T */
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:YES
-                    resultRows:seq_q resultColumns:seq_k interiorColumns:head_dim
-                         alpha:(double)scale beta:0.0];
-            [mm encodeToCommandBuffer:cmdBuffer
+            [mm_qk encodeToCommandBuffer:cmdBuffer
                            leftMatrix:matQh rightMatrix:matKh resultMatrix:matSh];
         }
 
@@ -962,11 +1040,7 @@ void vox_metal_batched_attention(float *out,
                     descriptor:descOh];
 
             /* out_h = scores_h @ V_h */
-            MPSMatrixMultiplication *mm = [[MPSMatrixMultiplication alloc]
-                initWithDevice:g_device transposeLeft:NO transposeRight:NO
-                    resultRows:seq_q resultColumns:head_dim interiorColumns:seq_k
-                         alpha:1.0 beta:0.0];
-            [mm encodeToCommandBuffer:cmdBuffer
+            [mm_sv encodeToCommandBuffer:cmdBuffer
                            leftMatrix:matSh rightMatrix:matVh resultMatrix:matOh];
         }
 
