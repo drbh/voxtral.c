@@ -177,6 +177,13 @@ typedef struct {
     /* BF16 direct mmap mode (weights stay as bf16, convert on-the-fly) */
     int use_bf16;
 
+    /* Encoder KV cache (rolling: compacted at window=750) */
+    float *enc_kv_cache_k;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
+    float *enc_kv_cache_v;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
+    int enc_kv_cache_len;     /* physical cache length */
+    int enc_kv_cache_max;     /* allocated capacity */
+    int enc_kv_pos_offset;    /* logical offset from rolling compaction */
+
     /* Persistent single-token decoder buffers (allocated on first forward) */
     float *dec_x, *dec_x_norm, *dec_q, *dec_k, *dec_v;
     float *dec_attn_out, *dec_proj_out;
@@ -256,9 +263,15 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx);
  * Internal Functions (used by encoder/decoder implementations)
  * ======================================================================== */
 
-/* Audio encoder forward pass */
+/* Audio encoder forward pass (full, non-incremental) */
 float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                            int mel_frames, int *out_seq_len);
+
+/* Incremental encoder forward pass (processes new_len post-conv-stem positions
+ * through transformer layers using encoder KV cache). Returns [new_len, 1280].
+ * Caller must free the returned buffer. */
+float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
+                                        int new_len, int *out_len);
 
 /* Adapter forward pass */
 float *vox_adapter_forward(vox_ctx_t *ctx, const float *enc_out,

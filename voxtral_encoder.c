@@ -299,6 +299,236 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
 }
 
 /* ========================================================================
+ * Incremental Encoder KV Cache
+ * ======================================================================== */
+
+#define ENC_KV_DIM (VOX_ENC_KV_HEADS * VOX_ENC_HEAD_DIM)  /* 32 * 64 = 2048 */
+
+static float *enc_kv_cache_k_at(vox_ctx_t *ctx, int layer, int pos) {
+    return ctx->enc_kv_cache_k + ((size_t)layer * ctx->enc_kv_cache_max + pos) * ENC_KV_DIM;
+}
+
+static float *enc_kv_cache_v_at(vox_ctx_t *ctx, int layer, int pos) {
+    return ctx->enc_kv_cache_v + ((size_t)layer * ctx->enc_kv_cache_max + pos) * ENC_KV_DIM;
+}
+
+static int enc_kv_cache_grow(vox_ctx_t *ctx, int required) {
+    if (ctx->enc_kv_cache_max >= required) return 0;
+
+    int new_max = ctx->enc_kv_cache_max ? ctx->enc_kv_cache_max : 256;
+    while (new_max < required) new_max *= 2;
+
+    size_t new_stride = (size_t)new_max * ENC_KV_DIM;
+    size_t total = (size_t)VOX_ENC_LAYERS * new_stride * sizeof(float);
+
+    float *new_k = (float *)calloc(1, total);
+    float *new_v = (float *)calloc(1, total);
+    if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
+
+    /* Copy existing data */
+    if (ctx->enc_kv_cache_len > 0 && ctx->enc_kv_cache_k) {
+        size_t old_stride = (size_t)ctx->enc_kv_cache_max * ENC_KV_DIM;
+        size_t copy = (size_t)ctx->enc_kv_cache_len * ENC_KV_DIM * sizeof(float);
+        for (int l = 0; l < VOX_ENC_LAYERS; l++) {
+            memcpy(new_k + l * new_stride, ctx->enc_kv_cache_k + l * old_stride, copy);
+            memcpy(new_v + l * new_stride, ctx->enc_kv_cache_v + l * old_stride, copy);
+        }
+    }
+
+    free(ctx->enc_kv_cache_k);
+    free(ctx->enc_kv_cache_v);
+    ctx->enc_kv_cache_k = new_k;
+    ctx->enc_kv_cache_v = new_v;
+    ctx->enc_kv_cache_max = new_max;
+    return 0;
+}
+
+static void enc_kv_cache_compact(vox_ctx_t *ctx) {
+    int keep = VOX_ENC_WINDOW;
+    if (ctx->enc_kv_cache_len <= keep) return;
+
+    int discard = ctx->enc_kv_cache_len - keep;
+    size_t keep_bytes = (size_t)keep * ENC_KV_DIM * sizeof(float);
+
+    for (int l = 0; l < VOX_ENC_LAYERS; l++) {
+        float *k_base = enc_kv_cache_k_at(ctx, l, 0);
+        float *k_src  = enc_kv_cache_k_at(ctx, l, discard);
+        float *v_base = enc_kv_cache_v_at(ctx, l, 0);
+        float *v_src  = enc_kv_cache_v_at(ctx, l, discard);
+        memmove(k_base, k_src, keep_bytes);
+        memmove(v_base, v_src, keep_bytes);
+    }
+
+    ctx->enc_kv_pos_offset += discard;
+    ctx->enc_kv_cache_len = keep;
+}
+
+/* ========================================================================
+ * Incremental Encoder Forward Pass
+ * ======================================================================== */
+
+float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
+                                        int new_len, int *out_len) {
+    vox_encoder_t *enc = &ctx->encoder;
+    int dim = VOX_ENC_DIM;        /* 1280 */
+    int n_heads = VOX_ENC_HEADS;  /* 32 */
+    int head_dim = VOX_ENC_HEAD_DIM; /* 64 */
+    int hidden = VOX_ENC_HIDDEN;  /* 5120 */
+    int qkv_dim = n_heads * head_dim; /* 2048 */
+
+    if (new_len <= 0) { *out_len = 0; return NULL; }
+
+    /* Compact if needed before adding new positions */
+    if (ctx->enc_kv_cache_len + new_len > VOX_ENC_WINDOW) {
+        enc_kv_cache_compact(ctx);
+    }
+
+    /* Grow cache if needed */
+    if (enc_kv_cache_grow(ctx, ctx->enc_kv_cache_len + new_len) != 0) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    int cache_len = ctx->enc_kv_cache_len;
+
+    if (vox_verbose >= 2)
+        fprintf(stderr, "  Encoder incremental: %d new positions (cache: %d, offset: %d)\n",
+                new_len, cache_len, ctx->enc_kv_pos_offset);
+
+    /* Working buffers for new positions only */
+    float *x = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    memcpy(x, x_new, (size_t)new_len * dim * sizeof(float));
+
+    float *x_norm = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    float *q = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
+    float *k = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
+    float *v = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
+    float *attn_out = (float *)malloc((size_t)new_len * qkv_dim * sizeof(float));
+    float *proj_out = (float *)malloc((size_t)new_len * dim * sizeof(float));
+    float *gate = (float *)malloc((size_t)new_len * hidden * sizeof(float));
+    float *up = (float *)malloc((size_t)new_len * hidden * sizeof(float));
+    float *ffn_out = (float *)malloc((size_t)new_len * dim * sizeof(float));
+
+    /* RoPE frequencies for logical positions */
+    int logical_start = ctx->enc_kv_pos_offset + cache_len;
+    int *positions = (int *)malloc((size_t)new_len * sizeof(int));
+    for (int i = 0; i < new_len; i++) positions[i] = logical_start + i;
+    float *rope_freqs = (float *)malloc((size_t)new_len * (head_dim / 2) * 2 * sizeof(float));
+    vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
+
+    for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
+        vox_enc_layer_t *l = &enc->layers[layer];
+
+        /* ---- Self-attention ---- */
+        vox_rms_norm(x_norm, x, l->attention_norm, new_len, dim, VOX_ENC_NORM_EPS);
+
+        /* Q, K, V projections on new positions only */
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_fused_qkv_bf16(new_len, dim, x_norm,
+                                      l->wq_weight_bf16, qkv_dim,
+                                      l->wk_weight_bf16, qkv_dim,
+                                      l->wv_weight_bf16, qkv_dim,
+                                      q, k, v);
+            /* Add biases (wq has bias, wk has NO bias, wv has bias) */
+            for (int s = 0; s < new_len; s++) {
+                for (int j = 0; j < qkv_dim; j++) {
+                    q[s * qkv_dim + j] += l->wq_bias[j];
+                    v[s * qkv_dim + j] += l->wv_bias[j];
+                }
+            }
+        } else {
+#endif
+            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
+            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
+            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
+#ifdef USE_METAL
+        }
+#endif
+
+        /* Apply RoPE to Q and K */
+        vox_apply_rope(q, rope_freqs, new_len, n_heads, head_dim);
+        vox_apply_rope(k, rope_freqs, new_len, n_heads, head_dim);
+
+        /* Copy new K, V into cache */
+        for (int s = 0; s < new_len; s++) {
+            memcpy(enc_kv_cache_k_at(ctx, layer, cache_len + s),
+                   k + (size_t)s * qkv_dim, qkv_dim * sizeof(float));
+            memcpy(enc_kv_cache_v_at(ctx, layer, cache_len + s),
+                   v + (size_t)s * qkv_dim, qkv_dim * sizeof(float));
+        }
+
+        /* Attention: q=[new_len], kv=[cache_len + new_len] */
+        int total_kv = cache_len + new_len;
+        float *full_k = enc_kv_cache_k_at(ctx, layer, 0);
+        float *full_v = enc_kv_cache_v_at(ctx, layer, 0);
+        float scale = 1.0f / sqrtf((float)head_dim);
+
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_batched_attention(attn_out, q, full_k, full_v,
+                                         new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
+                                         head_dim, scale, VOX_ENC_WINDOW, cache_len);
+        } else {
+#endif
+            vox_causal_attention(attn_out, q, full_k, full_v,
+                                 new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
+                                 head_dim, scale, VOX_ENC_WINDOW, cache_len);
+#ifdef USE_METAL
+        }
+#endif
+
+        /* Output projection + residual */
+        vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
+        vox_add_inplace(x, proj_out, new_len * dim);
+
+        /* ---- FFN ---- */
+        vox_rms_norm(x_norm, x, l->ffn_norm, new_len, dim, VOX_ENC_NORM_EPS);
+
+#ifdef USE_METAL
+        if (vox_metal_available()) {
+            vox_metal_fused_ffn_bf16(new_len, dim, hidden, x_norm,
+                                      l->w1_weight_bf16, l->w3_weight_bf16,
+                                      l->w2_weight_bf16, ffn_out);
+            /* Add w2 bias on CPU */
+            for (int s = 0; s < new_len; s++)
+                for (int j = 0; j < dim; j++)
+                    ffn_out[s * dim + j] += l->w2_bias[j];
+        } else {
+#endif
+            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
+            vox_silu(gate, new_len * hidden);
+            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
+            vox_mul_inplace(gate, up, new_len * hidden);
+            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
+#ifdef USE_METAL
+        }
+#endif
+
+        /* Residual */
+        vox_add_inplace(x, ffn_out, new_len * dim);
+
+        if (vox_verbose >= 2 && ((layer + 1) % 8 == 0 || layer == VOX_ENC_LAYERS - 1))
+            fprintf(stderr, "  Encoder inc layer %d/%d\n", layer + 1, VOX_ENC_LAYERS);
+    }
+
+    /* Final norm */
+    vox_rms_norm(x, x, enc->norm, new_len, dim, VOX_ENC_NORM_EPS);
+
+    /* Update cache length */
+    ctx->enc_kv_cache_len = cache_len + new_len;
+
+    /* Clean up */
+    free(x_norm); free(q); free(k); free(v);
+    free(attn_out); free(proj_out);
+    free(gate); free(up); free(ffn_out);
+    free(positions); free(rope_freqs);
+
+    *out_len = new_len;
+    return x;
+}
+
+/* ========================================================================
  * Adapter Forward Pass
  * ======================================================================== */
 
