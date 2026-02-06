@@ -24,6 +24,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -i <file>   Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin     Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
     fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  -I <secs>   Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --debug     Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent    No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h          Show this help\n");
@@ -64,12 +65,19 @@ int main(int argc, char **argv) {
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
+    float interval = -1.0f; /* <0 means use default */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             model_dir = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
             input_wav = argv[++i];
+        } else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
+            interval = (float)atof(argv[++i]);
+            if (interval <= 0) {
+                fprintf(stderr, "Error: -I requires a positive number of seconds\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
@@ -115,6 +123,7 @@ int main(int argc, char **argv) {
         vox_free(ctx);
         return 1;
     }
+    if (interval > 0) vox_set_processing_interval(s, interval);
 
     if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
