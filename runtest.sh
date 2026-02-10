@@ -11,7 +11,7 @@
 set -e
 
 # MODEL_DIR="voxtral-model"
-MODEL_DIR="voxtral-model-int8"
+MODEL_DIR="voxtral-model-q8"
 OGG="samples/antirez_speaking_italian_short.ogg"
 VOXTRAL="./voxtral"
 TMPWAV="/tmp/voxtral_test_$$.wav"
